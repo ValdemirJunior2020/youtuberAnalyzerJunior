@@ -1,70 +1,71 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
-import { DATA_DIR, getSettings } from './store.js';
+import { DATA_DIR, getActiveChannel } from './store.js';
 
-let context = null;
-let page = null;
-
-const profileDir = path.join(DATA_DIR, 'browser-profile');
+const sessions = new Map();
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function launchPersistent() {
-  fs.mkdirSync(profileDir, { recursive: true });
+function profileDirFor(channelId) {
+  return path.join(DATA_DIR, 'browser-profiles', channelId);
+}
 
-  if (context) {
+async function launchPersistent(channel) {
+  const existing = sessions.get(channel.id);
+  if (existing?.context) {
     try {
-      if (context.pages().length) return context;
+      if (existing.context.pages().length) return existing;
     } catch {}
-    context = null;
+    sessions.delete(channel.id);
   }
 
-  const baseOptions = {
-    headless: false,
-    viewport: null,
-    args: ['--start-maximized']
-  };
+  const profileDir = profileDirFor(channel.id);
+  fs.mkdirSync(profileDir, { recursive: true });
 
+  const baseOptions = { headless: false, viewport: null, args: ['--start-maximized'] };
+  let context;
   try {
-    context = await chromium.launchPersistentContext(profileDir, {
-      ...baseOptions,
-      channel: 'chrome'
-    });
+    context = await chromium.launchPersistentContext(profileDir, { ...baseOptions, channel: 'chrome' });
   } catch {
     context = await chromium.launchPersistentContext(profileDir, baseOptions);
   }
 
-  context.on('close', () => {
-    context = null;
-    page = null;
-  });
-
-  return context;
+  const page = context.pages()[0] || await context.newPage();
+  const session = { context, page, profileDir };
+  sessions.set(channel.id, session);
+  context.on('close', () => sessions.delete(channel.id));
+  return session;
 }
 
 export async function openStudio() {
-  const browserContext = await launchPersistent();
-  page = browserContext.pages()[0] || await browserContext.newPage();
-  await page.goto('https://studio.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const channel = getActiveChannel();
+  const session = await launchPersistent(channel);
+  await session.page.goto('https://studio.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
   return {
     opened: true,
-    url: page.url(),
-    message: 'YouTube Studio opened. Sign in normally if Google asks you to.'
+    url: session.page.url(),
+    channelId: channel.id,
+    channelName: channel.name,
+    message: `YouTube Studio opened for ${channel.name}. Sign in normally if Google asks you to.`
   };
 }
 
 async function getActivePage() {
-  if (!context || !page || page.isClosed()) await openStudio();
-  return page;
+  const channel = getActiveChannel();
+  let session = sessions.get(channel.id);
+  if (!session || session.page.isClosed()) {
+    await openStudio();
+    session = sessions.get(channel.id);
+  }
+  return session.page;
 }
 
 function firstMetric(lines, labels) {
   const clean = lines.map(x => x.trim()).filter(Boolean);
   const numberLike = /^[-+]?\d[\d,.]*(?:\s?[KMB])?(?:\.\d+)?%?$/i;
-
   for (const label of labels) {
     const index = clean.findIndex(line => line.toLowerCase() === label.toLowerCase() || line.toLowerCase().startsWith(`${label.toLowerCase()} `));
     if (index >= 0) {
@@ -94,10 +95,7 @@ function parseOverview(text) {
 
 async function clickNavigation(target) {
   const p = await getActivePage();
-  const patterns = target === 'analytics'
-    ? [/Analytics/i]
-    : [/Content/i];
-
+  const patterns = target === 'analytics' ? [/Analytics/i] : [/Content/i];
   for (const pattern of patterns) {
     try {
       const item = p.getByText(pattern, { exact: true }).first();
@@ -108,7 +106,6 @@ async function clickNavigation(target) {
       }
     } catch {}
   }
-
   try {
     const selector = target === 'analytics' ? 'a[href*="analytics"]' : 'a[href*="videos"]';
     const link = p.locator(selector).first();
@@ -118,7 +115,6 @@ async function clickNavigation(target) {
       return true;
     }
   } catch {}
-
   return false;
 }
 
@@ -130,14 +126,13 @@ async function visibleText() {
 
 async function scanVideoRows() {
   const p = await getActivePage();
-  const videos = await p.evaluate(() => {
+  return p.evaluate(() => {
     const selectors = ['ytcp-video-row', 'ytcp-video-list-cell-video', '[role="row"]'];
     let rows = [];
     for (const selector of selectors) {
       rows = Array.from(document.querySelectorAll(selector));
       if (rows.length > 1) break;
     }
-
     const seen = new Set();
     const out = [];
     for (const row of rows.slice(0, 60)) {
@@ -147,15 +142,10 @@ async function scanVideoRows() {
       const title = (titleEl?.textContent || '').trim();
       if (!title || seen.has(title)) continue;
       seen.add(title);
-      out.push({
-        title,
-        rawText: text.slice(0, 1800)
-      });
+      out.push({ title, rawText: text.slice(0, 1800) });
     }
     return out;
   }).catch(() => []);
-
-  return videos;
 }
 
 function detectLogin(text, url) {
@@ -164,14 +154,15 @@ function detectLogin(text, url) {
 }
 
 export async function scanChannel() {
+  const channel = getActiveChannel();
   const p = await getActivePage();
   if (!p.url().includes('studio.youtube.com')) {
     await p.goto('https://studio.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
   }
 
-  let homeText = await visibleText();
+  const homeText = await visibleText();
   if (detectLogin(homeText, p.url())) {
-    throw new Error('YouTube Studio is waiting for login. Complete the login in the opened browser, then scan again.');
+    throw new Error(`YouTube Studio for ${channel.name} is waiting for login. Complete the login, then scan again.`);
   }
 
   await clickNavigation('analytics');
@@ -184,11 +175,12 @@ export async function scanChannel() {
   const contentText = await visibleText();
   const videos = await scanVideoRows();
 
-  const settings = getSettings();
   return {
     id: `snap_${Date.now()}`,
     capturedAt: new Date().toISOString(),
-    channelName: settings.channelName,
+    channelId: channel.id,
+    channelName: channel.name,
+    madeForKids: channel.madeForKids,
     overview,
     videos,
     analyticsText: analyticsText.slice(0, 50000),
@@ -199,9 +191,13 @@ export async function scanChannel() {
 }
 
 export async function getStudioStatus() {
+  const channel = getActiveChannel();
+  const session = sessions.get(channel.id);
   return {
-    browserOpen: Boolean(context && page && !page.isClosed()),
-    currentUrl: page && !page.isClosed() ? page.url() : null,
-    profileDir
+    browserOpen: Boolean(session?.context && session?.page && !session.page.isClosed()),
+    currentUrl: session?.page && !session.page.isClosed() ? session.page.url() : null,
+    profileDir: profileDirFor(channel.id),
+    channelId: channel.id,
+    channelName: channel.name
   };
 }
