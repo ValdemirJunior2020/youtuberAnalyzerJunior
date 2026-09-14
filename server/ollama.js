@@ -29,6 +29,13 @@ function chooseModel(models, preferred) {
   return models[0] || '';
 }
 
+function channelSystem(snapshot) {
+  const audience = snapshot.madeForKids
+    ? 'This channel is marked Made for Kids. YouTube comments are normally unavailable, so do not treat missing comments as a weakness and do not recommend comment-based strategies.'
+    : 'This is a general-audience channel. Comments may be useful when they are present in the supplied Studio data.';
+  return `You are the private YouTube channel analyst for ${snapshot.channelName || 'this channel'}. ${audience} Analyze only the channel data provided. Be practical, conservative, and easy to understand. Never invent metrics. If a metric is missing, say it is unavailable. Focus on patterns that can improve titles, thumbnails, hooks, pacing, retention, upload consistency, audience fit, and episode packaging. Return concise Markdown with these headings: Channel Health, What Is Working, What Needs Attention, Best Opportunities, Suggested Tests, Next 3 Actions.`;
+}
+
 export async function analyzeSnapshot(snapshot, focus = '') {
   const status = await getOllamaStatus();
   if (!status.online) throw new Error('Ollama is not running. Start Ollama and try again.');
@@ -39,29 +46,26 @@ export async function analyzeSnapshot(snapshot, focus = '') {
   const trimmed = {
     capturedAt: snapshot.capturedAt,
     channelName: snapshot.channelName,
+    madeForKids: snapshot.madeForKids,
     overview: snapshot.overview,
     videos: (snapshot.videos || []).slice(0, 40),
     analyticsText: String(snapshot.analyticsText || '').slice(0, 22000),
     contentText: String(snapshot.contentText || '').slice(0, 16000)
   };
 
-  const system = `You are the private YouTube channel analyst for Bramble&Grace, a children's Christian storytelling channel. Analyze only the channel data provided. Be practical, conservative, and easy to understand. Never invent metrics. If a metric is missing, say it is unavailable. Focus on patterns that can improve titles, thumbnails, hooks, pacing, retention, upload consistency, audience fit, and episode packaging. Do not recommend clickbait that misrepresents a children's video. Return concise Markdown with these headings: Channel Health, What Is Working, What Needs Attention, Best Opportunities, Suggested Tests, Next 3 Actions.`;
-
   const user = `Analyze this saved YouTube Studio snapshot. ${focus ? `Special focus: ${focus}` : ''}\n\nDATA:\n${JSON.stringify(trimmed, null, 2)}`;
-
   const data = await request('/api/chat', {
     method: 'POST',
     body: JSON.stringify({
       model,
       stream: false,
       messages: [
-        { role: 'system', content: system },
+        { role: 'system', content: channelSystem(snapshot) },
         { role: 'user', content: user }
       ],
       options: { temperature: 0.2 }
     })
   });
-
   return { model, text: data.message?.content || 'No analysis returned.' };
 }
 
@@ -72,6 +76,10 @@ export async function askChannel(snapshot, question) {
   const model = chooseModel(status.models, settings.model);
   if (!model) throw new Error('No Ollama model is installed.');
 
+  const audienceRule = snapshot.madeForKids
+    ? 'This is Made for Kids content, so comments are normally disabled by YouTube. Do not suggest comment-based analysis.'
+    : 'Comments may be considered only if they appear in the supplied data.';
+
   const data = await request('/api/chat', {
     method: 'POST',
     body: JSON.stringify({
@@ -80,7 +88,7 @@ export async function askChannel(snapshot, question) {
       messages: [
         {
           role: 'system',
-          content: 'You answer questions about the Bramble&Grace YouTube channel using only the supplied YouTube Studio snapshot. Never invent numbers. Keep answers short, clear, and useful.'
+          content: `You answer questions about the ${snapshot.channelName || 'selected'} YouTube channel using only the supplied YouTube Studio snapshot. ${audienceRule} Never invent numbers. Keep answers short, clear, and useful.`
         },
         {
           role: 'user',
@@ -90,6 +98,5 @@ export async function askChannel(snapshot, question) {
       options: { temperature: 0.15 }
     })
   });
-
   return { model, text: data.message?.content || 'No answer returned.' };
 }
